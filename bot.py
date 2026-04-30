@@ -1,15 +1,14 @@
 """
-Discord Stock Watchlist & Technical Analysis Bot
+Discord Pro Market Scanner Bot
 
 Features:
-- Add/remove stocks to a persistent watchlist (SQLite)
-- Automatic price-drop alerts
-- Technical analysis on demand:
-  - Trend (20/50 MA)
-  - RSI (14)
-  - MACD (12, 26, 9)
-  - Bullish / Bearish / Neutral bias
-- Async-safe (non-blocking) data fetching
+- S&P 500 universe scanner
+- Market cap + volume filtering
+- Golden / Death cross detection (20/50 MA)
+- Setup scoring system
+- Duplicate signal prevention
+- Top setups ranking
+- Discord alerts
 """
 
 import os
@@ -24,7 +23,7 @@ import pandas as pd
 import yfinance as yf
 
 # -------------------------------------------------
-# Configuration
+# CONFIG
 # -------------------------------------------------
 
 load_dotenv()
@@ -33,10 +32,9 @@ TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
 DB_FILE = "watchlist.db"
-DROP_THRESHOLD = 0.15  # 15% price drop alert
 
 # -------------------------------------------------
-# Discord Bot Setup
+# BOT SETUP
 # -------------------------------------------------
 
 intents = discord.Intents.default()
@@ -45,256 +43,192 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # -------------------------------------------------
-# Database Utilities
+# STATE
 # -------------------------------------------------
 
-def init_db():
-    """Create watchlist database if it does not exist."""
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist (
-                symbol TEXT PRIMARY KEY,
-                baseline REAL NOT NULL,
-                alerted INTEGER DEFAULT 0
-            )
-        """)
-
-def db_execute(query, params=(), fetch=False):
-    """Execute SQLite queries safely."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        return cur.fetchall() if fetch else None
+last_signals = {}
 
 # -------------------------------------------------
-# Data Fetch Helpers (Async-Safe)
+# UNIVERSE (S&P 500)
 # -------------------------------------------------
 
-async def fetch_current_price(symbol: str):
-    """Fetch latest closing price without blocking the event loop."""
+def load_sp500():
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    table = pd.read_html(url)[0]
+    return table["Symbol"].str.replace(".", "-", regex=False).tolist()
+
+SP500 = load_sp500()
+
+# -------------------------------------------------
+# DATA FETCH
+# -------------------------------------------------
+
+async def fetch_history(symbol):
     def _fetch():
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="1d")
-        if df.empty:
-            return None
-        return float(df["Close"].iloc[-1])
-
-    return await asyncio.to_thread(_fetch)
-
-async def fetch_history(symbol: str, period="3mo"):
-    """Fetch historical price data."""
-    def _fetch():
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period)
+        df = yf.Ticker(symbol).history(period="1y")
         return df if not df.empty else None
 
     return await asyncio.to_thread(_fetch)
 
+async def fetch_current_price(symbol):
+    def _fetch():
+        df = yf.Ticker(symbol).history(period="1d")
+        return None if df.empty else float(df["Close"].iloc[-1])
+
+    return await asyncio.to_thread(_fetch)
+
 # -------------------------------------------------
-# Technical Indicator Calculations
+# FILTERS
 # -------------------------------------------------
 
-def calculate_indicators(df: pd.DataFrame):
+async def quick_liquidity_check(symbol):
+    def _fetch():
+        try:
+            t = yf.Ticker(symbol)
+            info = t.info
+
+            return (
+                (info.get("marketCap") or 0) >= 10_000_000 and
+                (info.get("volume") or 0) >= 3_000_000
+            )
+        except:
+            return False
+
+    return await asyncio.to_thread(_fetch)
+
+# -------------------------------------------------
+# SCORING
+# -------------------------------------------------
+
+def score_setup(df):
     close = df["Close"]
 
-    # ----- RSI (14) -----
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    # ----- MACD (12, 26, 9) -----
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-
-    # ----- Trend (20 / 50 MA) -----
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
 
-    trend = "Sideways"
-    if ma20.iloc[-1] > ma50.iloc[-1]:
-        trend = "Uptrend"
-    elif ma20.iloc[-1] < ma50.iloc[-1]:
-        trend = "Downtrend"
+    score = 0
 
-    return {
-        "rsi": round(rsi.iloc[-1], 2),
-        "macd": round(macd.iloc[-1], 4),
-        "signal": round(signal.iloc[-1], 4),
-        "trend": trend
-    }
+    if ma20.iloc[-1] > ma50.iloc[-1]:
+        score += 2
+
+    if "Volume" in df.columns:
+        vol = df["Volume"]
+        if vol.iloc[-1] > vol.rolling(20).mean().iloc[-1]:
+            score += 1
+
+    return score
 
 # -------------------------------------------------
-# Bot Events
+# CROSS DETECTION
+# -------------------------------------------------
+
+def detect_cross(df):
+    close = df["Close"]
+
+    ma20 = close.rolling(20).mean()
+    ma50 = close.rolling(50).mean()
+
+    if len(df) < 55:
+        return None
+
+    prev_20, prev_50 = ma20.iloc[-2], ma50.iloc[-2]
+    curr_20, curr_50 = ma20.iloc[-1], ma50.iloc[-1]
+
+    if prev_20 <= prev_50 and curr_20 > curr_50:
+        return "golden"
+
+    if prev_20 >= prev_50 and curr_20 < curr_50:
+        return "death"
+
+    return None
+
+# -------------------------------------------------
+# SCAN ENGINE
+# -------------------------------------------------
+
+async def scan_symbol(symbol):
+    df = await fetch_history(symbol)
+
+    if df is None or len(df) < 60:
+        return None
+
+    signal = detect_cross(df)
+    score = score_setup(df)
+
+    return symbol, signal, score
+
+# -------------------------------------------------
+# BOT READY
 # -------------------------------------------------
 
 @bot.event
 async def on_ready():
-    init_db()
-    watchlist_checker.start()
-    print(f"✅ Logged in as {bot.user}")
+    print(f"Logged in as {bot.user}")
+    scanner.start()
 
 # -------------------------------------------------
-# Commands
-# -------------------------------------------------
-
-@bot.command()
-async def add(ctx, symbol: str):
-    """Add a stock to the watchlist."""
-    symbol = symbol.upper()
-
-    if db_execute(
-        "SELECT 1 FROM watchlist WHERE symbol = ?",
-        (symbol,),
-        fetch=True
-    ):
-        await ctx.send(f"⚠️ **{symbol}** is already being tracked.")
-        return
-
-    price = await fetch_current_price(symbol)
-    if price is None:
-        await ctx.send("❌ Invalid stock symbol.")
-        return
-
-    db_execute(
-        "INSERT INTO watchlist (symbol, baseline, alerted) VALUES (?, ?, 0)",
-        (symbol, price)
-    )
-
-    await ctx.send(f"✅ Added **{symbol}** at baseline **${price:.2f}**")
-
-@bot.command()
-async def remove(ctx, symbol: str):
-    """Remove a stock from the watchlist."""
-    symbol = symbol.upper()
-    db_execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
-    await ctx.send(f"🗑️ Removed **{symbol}** from the watchlist.")
-
-@bot.command()
-async def watchlist(ctx):
-    """Show tracked stocks."""
-    rows = db_execute(
-        "SELECT symbol, baseline FROM watchlist",
-        fetch=True
-    )
-
-    if not rows:
-        await ctx.send("📭 Watchlist is empty.")
-        return
-
-    msg = "**📈 Watchlist:**\n"
-    for symbol, baseline in rows:
-        msg += f"- **{symbol}** — baseline ${baseline:.2f}\n"
-
-    await ctx.send(msg)
-
-@bot.command()
-async def reset(ctx, symbol: str):
-    """Reset alert status for a stock."""
-    symbol = symbol.upper()
-    db_execute(
-        "UPDATE watchlist SET alerted = 0 WHERE symbol = ?",
-        (symbol,)
-    )
-    await ctx.send(f"🔁 Alerts reset for **{symbol}**")
-
-@bot.command()
-async def analyze(ctx, symbol: str):
-    """Analyze trend, RSI, MACD, and sentiment."""
-    symbol = symbol.upper()
-
-    df = await fetch_history(symbol)
-    if df is None or len(df) < 60:
-        await ctx.send("❌ Not enough data to analyze.")
-        return
-
-    ind = calculate_indicators(df)
-
-    bullish = 0
-    bearish = 0
-
-    # RSI vote
-    if ind["rsi"] > 50:
-        bullish += 1
-    else:
-        bearish += 1
-
-    # MACD vote
-    if ind["macd"] > ind["signal"]:
-        bullish += 1
-    else:
-        bearish += 1
-
-    # Trend vote
-    if ind["trend"] == "Uptrend":
-        bullish += 1
-    elif ind["trend"] == "Downtrend":
-        bearish += 1
-
-    sentiment = "Neutral ⚪"
-    if bullish >= 2:
-        sentiment = "Bullish 📈"
-    elif bearish >= 2:
-        sentiment = "Bearish 📉"
-
-    await ctx.send(
-        f"📊 **{symbol} Technical Analysis**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🔹 Trend: **{ind['trend']}**\n"
-        f"🔹 RSI (14): **{ind['rsi']}**\n"
-        f"🔹 MACD: **{ind['macd']}**\n"
-        f"🔹 Signal: **{ind['signal']}**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧭 Overall Bias: **{sentiment}**"
-    )
-
-# -------------------------------------------------
-# Background Alert Task
+# PRO SCANNER LOOP
 # -------------------------------------------------
 
 @tasks.loop(minutes=15)
-async def watchlist_checker():
+async def scanner():
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
 
-    stocks = db_execute(
-        "SELECT symbol, baseline FROM watchlist WHERE alerted = 0",
-        fetch=True
-    )
+    candidates = []
 
-    for symbol, baseline in stocks:
-        current_price = await fetch_current_price(symbol)
-        if current_price is None:
+    # STEP 1: FILTER UNIVERSE
+    for symbol in SP500:
+        ok = await quick_liquidity_check(symbol)
+        if ok:
+            candidates.append(symbol)
+
+        await asyncio.sleep(0.05)
+
+    results = []
+
+    # STEP 2: SCAN SYMBOLS
+    for symbol in candidates:
+        res = await scan_symbol(symbol)
+        if res:
+            results.append(res)
+
+        await asyncio.sleep(0.05)
+
+    signals = []
+
+    # STEP 3: PROCESS RESULTS
+    for symbol, signal, score in results:
+
+        if not signal:
             continue
 
-        drop = (baseline - current_price) / baseline
+        if last_signals.get(symbol) == signal:
+            continue
 
-        if drop >= DROP_THRESHOLD:
-            await channel.send(
-                f"🚨 **PRICE ALERT: {symbol}**\n"
-                f"📉 Drop: **{drop * 100:.1f}%**\n"
-                f"💲 Baseline: ${baseline:.2f}\n"
-                f"💰 Current: ${current_price:.2f}"
-            )
+        last_signals[symbol] = signal
 
-            db_execute(
-                "UPDATE watchlist SET alerted = 1 WHERE symbol = ?",
-                (symbol,)
-            )
+        signals.append((symbol, signal, score))
 
-@watchlist_checker.before_loop
-async def before_watchlist_checker():
-    await bot.wait_until_ready()
+        emoji = "🚀" if signal == "golden" else "💀"
+
+        await channel.send(
+            f"{emoji} **{signal.upper()} CROSS**\n"
+            f"{symbol}\n"
+            f"Score: {score}"
+        )
+
+    # STEP 4: TOP SETUPS
+    top = sorted(signals, key=lambda x: x[2], reverse=True)[:5]
+
+    if top:
+        msg = "**🔥 TOP SETUPS THIS SCAN 🔥**\n\n" + "\n".join(
+            [f"{s} ({sig}) Score: {sc}" for s, sig, sc in top]
+        )
+
+        await channel.send(msg)
 
 # -------------------------------------------------
-# Run Bot
+# RUN BOT
 # -------------------------------------------------
 
 bot.run(TOKEN)

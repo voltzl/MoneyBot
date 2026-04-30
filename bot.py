@@ -6,6 +6,7 @@ Features:
 - Price drop alerts
 - Golden Cross / Death Cross alerts (20/50 MA)
 - RSI, MACD, Trend analysis
+- Fibonacci retracement command (!fib)
 - Persistent alert tracking
 """
 
@@ -118,6 +119,31 @@ def calculate_indicators(df):
     }
 
 # -------------------------------------------------
+# Fibonacci
+# -------------------------------------------------
+
+def calculate_fibonacci_levels(df):
+    high = df["High"].max()
+    low = df["Low"].min()
+
+    if high == low:
+        return None
+
+    diff = high - low
+
+    levels = {
+        "0.0%": high,
+        "23.6%": high - 0.236 * diff,
+        "38.2%": high - 0.382 * diff,
+        "50.0%": high - 0.5 * diff,
+        "61.8%": high - 0.618 * diff,
+        "78.6%": high - 0.786 * diff,
+        "100.0%": low
+    }
+
+    return {k: round(v, 2) for k, v in levels.items()}
+
+# -------------------------------------------------
 # Cross Detection (Golden / Death)
 # -------------------------------------------------
 
@@ -204,6 +230,41 @@ async def analyze(ctx, symbol: str):
         f"MACD: {ind['macd']} / {ind['signal']}"
     )
 
+# -------- NEW FIB COMMAND --------
+
+@bot.command()
+async def fib(ctx, symbol: str):
+    symbol = symbol.upper()
+
+    df = await fetch_history(symbol)
+
+    if df is None or len(df) < 20:
+        return await ctx.send("❌ Not enough data")
+
+    df = df.tail(90)
+
+    fib = calculate_fibonacci_levels(df)
+
+    if fib is None:
+        return await ctx.send("❌ Could not calculate Fibonacci levels")
+
+    price = await fetch_current_price(symbol)
+    price_str = f"${price:.2f}" if price else "N/A"
+
+    msg = (
+        f"🧮 Fibonacci — {symbol}\n"
+        f"Current Price: {price_str}\n\n"
+        f"0%   : {fib['0.0%']}\n"
+        f"23.6%: {fib['23.6%']}\n"
+        f"38.2%: {fib['38.2%']}\n"
+        f"50%  : {fib['50.0%']}\n"
+        f"61.8%: {fib['61.8%']}\n"
+        f"78.6%: {fib['78.6%']}\n"
+        f"100% : {fib['100.0%']}"
+    )
+
+    await ctx.send(msg)
+
 # -------------------------------------------------
 # Background Task
 # -------------------------------------------------
@@ -219,7 +280,7 @@ async def watchlist_checker():
 
     for symbol, baseline, g_flag, d_flag in stocks:
 
-        # ---------------- PRICE DROP ----------------
+        # PRICE DROP
         price = await fetch_current_price(symbol)
         if price is None:
             continue
@@ -227,11 +288,9 @@ async def watchlist_checker():
         drop = (baseline - price) / baseline
 
         if drop >= DROP_THRESHOLD:
-            await channel.send(
-                f"🚨 {symbol} dropped {drop*100:.1f}%"
-            )
+            await channel.send(f"🚨 {symbol} dropped {drop*100:.1f}%")
 
-        # ---------------- CROSS CHECK ----------------
+        # CROSS CHECK
         df = await fetch_history(symbol)
         if df is None or len(df) < 60:
             continue

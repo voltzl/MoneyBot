@@ -12,15 +12,14 @@ Features:
 """
 
 import os
-import sqlite3
 import asyncio
+import requests
+import pandas as pd
+import yfinance as yf
 
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-
-import pandas as pd
-import yfinance as yf
 
 # -------------------------------------------------
 # CONFIG
@@ -29,9 +28,15 @@ import yfinance as yf
 load_dotenv()
 
 TOKEN = os.getenv("TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-DB_FILE = "watchlist.db"
+if not TOKEN:
+    raise ValueError("TOKEN is not set in environment variables")
+
+if not CHANNEL_ID:
+    raise ValueError("CHANNEL_ID is not set in environment variables")
+
+CHANNEL_ID = int(CHANNEL_ID)
 
 # -------------------------------------------------
 # BOT SETUP
@@ -47,17 +52,42 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # -------------------------------------------------
 
 last_signals = {}
+SP500 = []
 
 # -------------------------------------------------
-# UNIVERSE (S&P 500)
+# S&P 500 LOADER (FIXED 403 ISSUE)
 # -------------------------------------------------
 
 def load_sp500():
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    table = pd.read_html(url)[0]
-    return table["Symbol"].str.replace(".", "-", regex=False).tolist()
+    """
+    Loads S&P 500 tickers from Wikipedia safely using headers
+    Prevents HTTP 403 on EC2 / cloud servers
+    """
+    try:
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 
-SP500 = load_sp500()
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0 Safari/537.36"
+            )
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+
+        tables = pd.read_html(response.text)
+        table = tables[0]
+
+        symbols = table["Symbol"].str.replace(".", "-", regex=False).tolist()
+        print(f"Loaded {len(symbols)} S&P 500 symbols")
+
+        return symbols
+
+    except Exception as e:
+        print("Failed to load S&P 500 list:", e)
+        return []
 
 # -------------------------------------------------
 # DATA FETCH
@@ -65,15 +95,11 @@ SP500 = load_sp500()
 
 async def fetch_history(symbol):
     def _fetch():
-        df = yf.Ticker(symbol).history(period="1y")
-        return df if not df.empty else None
-
-    return await asyncio.to_thread(_fetch)
-
-async def fetch_current_price(symbol):
-    def _fetch():
-        df = yf.Ticker(symbol).history(period="1d")
-        return None if df.empty else float(df["Close"].iloc[-1])
+        try:
+            df = yf.Ticker(symbol).history(period="1y")
+            return df if not df.empty else None
+        except:
+            return None
 
     return await asyncio.to_thread(_fetch)
 
@@ -85,7 +111,7 @@ async def quick_liquidity_check(symbol):
     def _fetch():
         try:
             t = yf.Ticker(symbol)
-            info = t.info
+            info = t.info or {}
 
             return (
                 (info.get("marketCap") or 0) >= 10_000_000 and
@@ -123,13 +149,13 @@ def score_setup(df):
 # -------------------------------------------------
 
 def detect_cross(df):
+    if len(df) < 55:
+        return None
+
     close = df["Close"]
 
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
-
-    if len(df) < 55:
-        return None
 
     prev_20, prev_50 = ma20.iloc[-2], ma50.iloc[-2]
     curr_20, curr_50 = ma20.iloc[-1], ma50.iloc[-1]
@@ -163,16 +189,28 @@ async def scan_symbol(symbol):
 
 @bot.event
 async def on_ready():
+    global SP500
+
     print(f"Logged in as {bot.user}")
-    scanner.start()
+
+    # Load S&P 500 AFTER bot is ready (safe + avoids startup lag)
+    if not SP500:
+        SP500 = load_sp500()
+
+    if not scanner.is_running():
+        scanner.start()
 
 # -------------------------------------------------
-# PRO SCANNER LOOP
+# SCANNER LOOP
 # -------------------------------------------------
 
 @tasks.loop(minutes=15)
 async def scanner():
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+
+    if not SP500:
+        print("SP500 list is empty, skipping scan")
+        return
 
     candidates = []
 

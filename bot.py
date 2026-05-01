@@ -1,3 +1,4 @@
+"""
 Discord Stock Watchlist & Technical Analysis Bot
 
 Features:

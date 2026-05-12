@@ -1,5 +1,5 @@
 """
-Discord Stock Watchlist & Technical Analysis Bot
+Discord Stock Watchlist & Technical Analysis Bot!
 
 Features:
 - Watchlist (SQLite)

@@ -3,11 +3,12 @@ Discord Stock Watchlist & Technical Analysis Bot
 
 Features:
 - Watchlist (SQLite)
-- Price drop alerts
+- Price drop alerts (with recovery reset)
 - Golden Cross / Death Cross alerts (20/50 MA)
 - RSI, MACD, Trend analysis
 - Fibonacci retracement command (!fib)
 - Persistent alert tracking
+- Optimized: cross checks run every ~1 hour, price checks every 15 min
 """
 
 import os
@@ -41,6 +42,9 @@ intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Tracks how many loop cycles have run (for throttling cross checks)
+cycle_counter = 0
 
 # -------------------------------------------------
 # Database
@@ -201,8 +205,12 @@ async def add(ctx, symbol: str):
 
 @bot.command()
 async def remove(ctx, symbol: str):
-    db_execute("DELETE FROM watchlist WHERE symbol = ?", (symbol.upper(),))
-    await ctx.send("🗑️ Removed")
+    symbol = symbol.upper()
+    exists = db_execute("SELECT 1 FROM watchlist WHERE symbol = ?", (symbol,), fetch=True)
+    if not exists:
+        return await ctx.send(f"⚠️ {symbol} is not in the watchlist")
+    db_execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+    await ctx.send(f"🗑️ Removed {symbol}")
 
 @bot.command()
 async def watchlist(ctx):
@@ -230,8 +238,6 @@ async def analyze(ctx, symbol: str):
         f"MACD: {ind['macd']} / {ind['signal']}"
     )
 
-# -------- NEW FIB COMMAND --------
-
 @bot.command()
 async def fib(ctx, symbol: str):
     symbol = symbol.upper()
@@ -243,9 +249,9 @@ async def fib(ctx, symbol: str):
 
     df = df.tail(90)
 
-    fib = calculate_fibonacci_levels(df)
+    fib_levels = calculate_fibonacci_levels(df)
 
-    if fib is None:
+    if fib_levels is None:
         return await ctx.send("❌ Could not calculate Fibonacci levels")
 
     price = await fetch_current_price(symbol)
@@ -254,13 +260,13 @@ async def fib(ctx, symbol: str):
     msg = (
         f"🧮 Fibonacci — {symbol}\n"
         f"Current Price: {price_str}\n\n"
-        f"0%   : {fib['0.0%']}\n"
-        f"23.6%: {fib['23.6%']}\n"
-        f"38.2%: {fib['38.2%']}\n"
-        f"50%  : {fib['50.0%']}\n"
-        f"61.8%: {fib['61.8%']}\n"
-        f"78.6%: {fib['78.6%']}\n"
-        f"100% : {fib['100.0%']}"
+        f"0%   : {fib_levels['0.0%']}\n"
+        f"23.6%: {fib_levels['23.6%']}\n"
+        f"38.2%: {fib_levels['38.2%']}\n"
+        f"50%  : {fib_levels['50.0%']}\n"
+        f"61.8%: {fib_levels['61.8%']}\n"
+        f"78.6%: {fib_levels['78.6%']}\n"
+        f"100% : {fib_levels['100.0%']}"
     )
 
     await ctx.send(msg)
@@ -271,49 +277,61 @@ async def fib(ctx, symbol: str):
 
 @tasks.loop(minutes=15)
 async def watchlist_checker():
-    channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+    global cycle_counter
+    cycle_counter += 1
+    check_crosses = (cycle_counter % 4 == 0)  # Run cross checks every ~1 hour
 
-    stocks = db_execute(
-        "SELECT symbol, baseline, golden_alerted, death_alerted FROM watchlist",
-        fetch=True
-    )
+    try:
+        channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
 
-    for symbol, baseline, g_flag, d_flag in stocks:
+        stocks = db_execute(
+            "SELECT symbol, baseline, alerted, golden_alerted, death_alerted FROM watchlist",
+            fetch=True
+        )
 
-        # PRICE DROP
-        price = await fetch_current_price(symbol)
-        if price is None:
-            continue
+        for symbol, baseline, alerted, g_flag, d_flag in stocks:
 
-        drop = (baseline - price) / baseline
+            # --- PRICE DROP CHECK (every cycle) ---
+            price = await fetch_current_price(symbol)
+            if price is None:
+                continue
 
-        if drop >= DROP_THRESHOLD:
-            await channel.send(f"🚨 {symbol} dropped {drop*100:.1f}%")
+            drop = (baseline - price) / baseline
 
-        # CROSS CHECK
-        df = await fetch_history(symbol)
-        if df is None or len(df) < 60:
-            continue
+            if drop >= DROP_THRESHOLD and not alerted:
+                await channel.send(f"🚨 {symbol} dropped {drop*100:.1f}% from baseline (${baseline:.2f} → ${price:.2f})")
+                db_execute("UPDATE watchlist SET alerted = 1 WHERE symbol = ?", (symbol,))
 
-        signal = detect_cross(df)
+            elif drop < DROP_THRESHOLD and alerted:
+                # Price recovered — reset so we can alert again if it drops again
+                db_execute("UPDATE watchlist SET alerted = 0 WHERE symbol = ?", (symbol,))
 
-        if signal == "golden" and not g_flag:
-            await channel.send(f"🚀 GOLDEN CROSS: {symbol}")
+            # --- CROSS CHECK (every ~1 hour) ---
+            if check_crosses:
+                df = await fetch_history(symbol)
+                if df is None or len(df) < 60:
+                    continue
 
-            db_execute(
-                "UPDATE watchlist SET golden_alerted = 1 WHERE symbol = ?",
-                (symbol,)
-            )
+                signal = detect_cross(df)
 
-        elif signal == "death" and not d_flag:
-            await channel.send(f"💀 DEATH CROSS: {symbol}")
+                if signal == "golden" and not g_flag:
+                    await channel.send(f"🚀 GOLDEN CROSS: {symbol} — 20MA crossed above 50MA")
+                    db_execute(
+                        "UPDATE watchlist SET golden_alerted = 1, death_alerted = 0 WHERE symbol = ?",
+                        (symbol,)
+                    )
 
-            db_execute(
-                "UPDATE watchlist SET death_alerted = 1 WHERE symbol = ?",
-                (symbol,)
-            )
+                elif signal == "death" and not d_flag:
+                    await channel.send(f"💀 DEATH CROSS: {symbol} — 20MA crossed below 50MA")
+                    db_execute(
+                        "UPDATE watchlist SET death_alerted = 1, golden_alerted = 0 WHERE symbol = ?",
+                        (symbol,)
+                    )
 
-        await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5)
+
+    except Exception as e:
+        print(f"[watchlist_checker error] {e}")
 
 @watchlist_checker.before_loop
 async def before_loop():

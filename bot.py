@@ -5,20 +5,28 @@ Features:
 - Watchlist (SQLite)
 - Price drop alerts with re-alert protection and auto-reset on recovery
 - Per-symbol custom drop thresholds
+- Trailing-peak drop tracking (alert measured from recent high, not just baseline)
 - Golden Cross / Death Cross alerts (20/50 MA) with proper flag resets
+- RSI overbought / oversold alerts
 - RSI, MACD, Trend analysis
 - Fibonacci retracement command (!fib)
 - Quick !price command
 - Charts attached to !analyze and !fib
 - Role/user mention on alerts
+- History caching to reduce API calls
+- Market-hours awareness
+- Failed-fetch counter to surface dead/delisted symbols
+- Custom !help command
 - Persistent alert tracking
 - Error handling in background task
 """
 
 import os
 import io
+import time
 import sqlite3
 import asyncio
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord.ext import commands, tasks
@@ -47,6 +55,19 @@ ALERT_MENTION_TYPE = os.getenv("ALERT_MENTION_TYPE", "role")  # "role" or "user"
 DB_FILE = "watchlist.db"
 DEFAULT_DROP_THRESHOLD = 0.15  # 15%
 
+# RSI alert bounds
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+
+# How long a cached history result stays fresh (seconds)
+HISTORY_CACHE_TTL = 600  # 10 minutes
+
+# How many consecutive failed fetches before we flag a symbol as likely dead
+FAIL_LIMIT = 5
+
+# Set to False to run the background loop regardless of market hours
+RESPECT_MARKET_HOURS = True
+
 # -------------------------------------------------
 # Bot Setup
 # -------------------------------------------------
@@ -54,7 +75,15 @@ DEFAULT_DROP_THRESHOLD = 0.15  # 15%
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# remove the default help so we can supply our own
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# -------------------------------------------------
+# History Cache
+# -------------------------------------------------
+
+# symbol -> (timestamp, dataframe)
+_history_cache = {}
 
 # -------------------------------------------------
 # Mention Helper
@@ -69,6 +98,33 @@ def alert_prefix():
     return f"<@&{ALERT_MENTION_ID}> "
 
 # -------------------------------------------------
+# Market Hours
+# -------------------------------------------------
+
+def market_is_open():
+    """
+    Rough check for US regular trading hours (9:30-16:00 ET, Mon-Fri).
+    ET is UTC-5 (EST) or UTC-4 (EDT). We approximate DST as Mar-Nov to avoid
+    a tz dependency; this is good enough for skipping nights and weekends.
+    Does not account for market holidays.
+    """
+    now_utc = datetime.now(timezone.utc)
+
+    # Approximate US Eastern offset: EDT (UTC-4) roughly Mar-Nov, else EST (UTC-5).
+    is_dst = 3 <= now_utc.month <= 11
+    offset = -4 if is_dst else -5
+    et = now_utc + timedelta(hours=offset)
+
+    if et.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+
+    open_minutes = 9 * 60 + 30
+    close_minutes = 16 * 60
+    now_minutes = et.hour * 60 + et.minute
+
+    return open_minutes <= now_minutes <= close_minutes
+
+# -------------------------------------------------
 # Database
 # -------------------------------------------------
 
@@ -79,17 +135,27 @@ def init_db():
                 symbol TEXT PRIMARY KEY,
                 baseline REAL NOT NULL,
                 threshold REAL DEFAULT 0.15,
+                peak REAL,
                 alerted INTEGER DEFAULT 0,
                 golden_alerted INTEGER DEFAULT 0,
-                death_alerted INTEGER DEFAULT 0
+                death_alerted INTEGER DEFAULT 0,
+                rsi_high_alerted INTEGER DEFAULT 0,
+                rsi_low_alerted INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0
             )
         """)
-        # Migrate older databases that predate the threshold column.
+        # Migrate older databases that predate newer columns.
         cols = [r[1] for r in conn.execute("PRAGMA table_info(watchlist)").fetchall()]
-        if "threshold" not in cols:
-            conn.execute(
-                "ALTER TABLE watchlist ADD COLUMN threshold REAL DEFAULT 0.15"
-            )
+        migrations = {
+            "threshold": "ALTER TABLE watchlist ADD COLUMN threshold REAL DEFAULT 0.15",
+            "peak": "ALTER TABLE watchlist ADD COLUMN peak REAL",
+            "rsi_high_alerted": "ALTER TABLE watchlist ADD COLUMN rsi_high_alerted INTEGER DEFAULT 0",
+            "rsi_low_alerted": "ALTER TABLE watchlist ADD COLUMN rsi_low_alerted INTEGER DEFAULT 0",
+            "fail_count": "ALTER TABLE watchlist ADD COLUMN fail_count INTEGER DEFAULT 0",
+        }
+        for col, stmt in migrations.items():
+            if col not in cols:
+                conn.execute(stmt)
 
 def db_execute(query, params=(), fetch=False):
     with sqlite3.connect(DB_FILE) as conn:
@@ -116,26 +182,39 @@ async def fetch_quote(symbol):
         return (float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2]))
     return await asyncio.to_thread(_fetch)
 
-async def fetch_history(symbol):
+async def fetch_history(symbol, use_cache=True):
+    """Fetch ~1y of history. Uses a short-lived cache to cut redundant calls."""
+    now = time.monotonic()
+
+    if use_cache:
+        cached = _history_cache.get(symbol)
+        if cached and (now - cached[0]) < HISTORY_CACHE_TTL:
+            return cached[1]
+
     def _fetch():
         df = yf.Ticker(symbol).history(period="1y")
         return df if not df.empty else None
-    return await asyncio.to_thread(_fetch)
+
+    df = await asyncio.to_thread(_fetch)
+    if df is not None:
+        _history_cache[symbol] = (now, df)
+    return df
 
 # -------------------------------------------------
 # Indicators
 # -------------------------------------------------
 
-def calculate_indicators(df):
-    close = df["Close"]
-
-    # RSI
+def compute_rsi_series(close, period=14):
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
+    rs = gain.rolling(period).mean() / loss.rolling(period).mean()
+    return 100 - (100 / (1 + rs))
 
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    rsi = 100 - (100 / (1 + rs))
+def calculate_indicators(df):
+    close = df["Close"]
+
+    rsi = compute_rsi_series(close)
 
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -277,6 +356,24 @@ async def on_ready():
 # -------------------------------------------------
 
 @bot.command()
+async def help(ctx):
+    """Show the command list."""
+    msg = (
+        "**\U0001f4c8 Stock Bot Commands**\n\n"
+        "`!add SYMBOL [percent]` - add a stock; optional drop-alert percent (default 15)\n"
+        "`!remove SYMBOL` - remove a stock\n"
+        "`!threshold SYMBOL percent` - change a stock's drop-alert percent\n"
+        "`!watchlist` - list tracked stocks, baselines, and thresholds\n"
+        "`!setbaseline SYMBOL` - reset a stock's baseline to its current price\n"
+        "`!price SYMBOL` - quick current price and day change\n"
+        "`!analyze SYMBOL` - trend, RSI, MACD, plus a chart\n"
+        "`!fib SYMBOL` - Fibonacci retracement levels, plus a chart\n\n"
+        "**Automatic alerts** (during market hours): price drops from peak, "
+        "golden/death crosses, and RSI overbought/oversold."
+    )
+    await ctx.send(msg)
+
+@bot.command()
 async def add(ctx, symbol: str, threshold: float = None):
     """Add a symbol. Optional threshold is a drop percent, e.g. !add AAPL 10"""
     symbol = symbol.upper()
@@ -292,11 +389,11 @@ async def add(ctx, symbol: str, threshold: float = None):
     thr = DEFAULT_DROP_THRESHOLD if threshold is None else threshold / 100.0
 
     db_execute(
-        "INSERT INTO watchlist (symbol, baseline, threshold) VALUES (?, ?, ?)",
-        (symbol, price, thr)
+        "INSERT INTO watchlist (symbol, baseline, threshold, peak) VALUES (?, ?, ?, ?)",
+        (symbol, price, thr, price)
     )
 
-    await ctx.send(f"\u2705 Added {symbol} at ${price:.2f} (alert at -{thr*100:.0f}%)")
+    await ctx.send(f"\u2705 Added {symbol} at ${price:.2f} (alert at -{thr*100:.0f}% from peak)")
 
 @bot.command()
 async def threshold(ctx, symbol: str, percent: float):
@@ -323,21 +420,27 @@ async def remove(ctx, symbol: str):
         return await ctx.send(f"\u26a0\ufe0f {symbol} is not in the watchlist")
 
     db_execute("DELETE FROM watchlist WHERE symbol = ?", (symbol,))
+    _history_cache.pop(symbol, None)
     await ctx.send(f"\U0001f5d1\ufe0f Removed {symbol}")
 
 @bot.command()
 async def watchlist(ctx):
-    rows = db_execute("SELECT symbol, baseline, threshold FROM watchlist", fetch=True)
+    rows = db_execute(
+        "SELECT symbol, baseline, threshold, peak FROM watchlist", fetch=True
+    )
 
     if not rows:
         return await ctx.send("Empty watchlist")
 
-    msg = "\n".join([f"{s} - ${b:.2f} (alert -{t*100:.0f}%)" for s, b, t in rows])
-    await ctx.send(msg)
+    lines = []
+    for s, b, t, peak in rows:
+        peak_str = f", peak ${peak:.2f}" if peak else ""
+        lines.append(f"{s} - ${b:.2f} (alert -{t*100:.0f}%{peak_str})")
+    await ctx.send("\n".join(lines))
 
 @bot.command()
 async def setbaseline(ctx, symbol: str):
-    """Reset the baseline for a symbol to its current price."""
+    """Reset the baseline (and peak) for a symbol to its current price."""
     symbol = symbol.upper()
 
     existing = db_execute("SELECT 1 FROM watchlist WHERE symbol = ?", (symbol,), fetch=True)
@@ -349,8 +452,8 @@ async def setbaseline(ctx, symbol: str):
         return await ctx.send("\u274c Could not fetch current price")
 
     db_execute(
-        "UPDATE watchlist SET baseline = ?, alerted = 0 WHERE symbol = ?",
-        (price, symbol)
+        "UPDATE watchlist SET baseline = ?, peak = ?, alerted = 0 WHERE symbol = ?",
+        (price, price, symbol)
     )
 
     await ctx.send(f"\u2705 Baseline for {symbol} reset to ${price:.2f}")
@@ -435,45 +538,80 @@ async def fib(ctx, symbol: str):
 
 @tasks.loop(minutes=15)
 async def watchlist_checker():
+    if RESPECT_MARKET_HOURS and not market_is_open():
+        return
+
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
     ping = alert_prefix()
 
     stocks = db_execute(
-        "SELECT symbol, baseline, threshold, alerted, golden_alerted, death_alerted FROM watchlist",
+        "SELECT symbol, baseline, threshold, peak, alerted, golden_alerted, "
+        "death_alerted, rsi_high_alerted, rsi_low_alerted, fail_count "
+        "FROM watchlist",
         fetch=True
     )
 
-    for symbol, baseline, thr, alerted, g_flag, d_flag in stocks:
+    for (symbol, baseline, thr, peak, alerted, g_flag, d_flag,
+         rsi_hi_flag, rsi_lo_flag, fail_count) in stocks:
         try:
-            # PRICE DROP
+            # PRICE
             price_now = await fetch_current_price(symbol)
             if price_now is None:
+                # Count the failure; flag once if it keeps happening.
+                new_fail = (fail_count or 0) + 1
+                db_execute(
+                    "UPDATE watchlist SET fail_count = ? WHERE symbol = ?",
+                    (new_fail, symbol)
+                )
+                if new_fail == FAIL_LIMIT:
+                    await channel.send(
+                        f"{ping}\u2753 {symbol} has failed {FAIL_LIMIT} fetches in a row. "
+                        f"It may be delisted or mistyped. Consider !remove {symbol}."
+                    )
                 continue
 
-            drop = (baseline - price_now) / baseline
+            # Reset the failure counter on any good fetch.
+            if fail_count:
+                db_execute(
+                    "UPDATE watchlist SET fail_count = 0 WHERE symbol = ?",
+                    (symbol,)
+                )
+
+            # TRAILING PEAK: update if we have a new high.
+            current_peak = peak if peak else baseline
+            if price_now > current_peak:
+                current_peak = price_now
+                db_execute(
+                    "UPDATE watchlist SET peak = ? WHERE symbol = ?",
+                    (current_peak, symbol)
+                )
+
+            # PRICE DROP from trailing peak
+            drop = (current_peak - price_now) / current_peak
 
             if drop >= thr:
                 if not alerted:
                     await channel.send(
-                        f"{ping}\U0001f6a8 {symbol} dropped {drop*100:.1f}% from baseline"
+                        f"{ping}\U0001f6a8 {symbol} dropped {drop*100:.1f}% from its recent peak "
+                        f"(${current_peak:.2f} -> ${price_now:.2f})"
                     )
                     db_execute(
                         "UPDATE watchlist SET alerted = 1 WHERE symbol = ?",
                         (symbol,)
                     )
             else:
-                # Price recovered, reset so it can fire again on a future drop.
                 if alerted:
                     db_execute(
                         "UPDATE watchlist SET alerted = 0 WHERE symbol = ?",
                         (symbol,)
                     )
 
-            # CROSS CHECK
+            # HISTORY-BASED CHECKS (cached)
             df = await fetch_history(symbol)
             if df is None or len(df) < 60:
                 continue
 
+            # CROSS CHECK
             signal = detect_cross(df)
 
             if signal == "golden" and not g_flag:
@@ -482,13 +620,44 @@ async def watchlist_checker():
                     "UPDATE watchlist SET golden_alerted = 1, death_alerted = 0 WHERE symbol = ?",
                     (symbol,)
                 )
-
             elif signal == "death" and not d_flag:
                 await channel.send(f"{ping}\U0001f480 DEATH CROSS: {symbol}")
                 db_execute(
                     "UPDATE watchlist SET death_alerted = 1, golden_alerted = 0 WHERE symbol = ?",
                     (symbol,)
                 )
+
+            # RSI CHECK
+            rsi_val = compute_rsi_series(df["Close"]).iloc[-1]
+            if pd.notna(rsi_val):
+                if rsi_val >= RSI_OVERBOUGHT and not rsi_hi_flag:
+                    await channel.send(
+                        f"{ping}\U0001f4c8 {symbol} RSI {rsi_val:.0f} (overbought, >= {RSI_OVERBOUGHT})"
+                    )
+                    db_execute(
+                        "UPDATE watchlist SET rsi_high_alerted = 1 WHERE symbol = ?",
+                        (symbol,)
+                    )
+                elif rsi_val <= RSI_OVERSOLD and not rsi_lo_flag:
+                    await channel.send(
+                        f"{ping}\U0001f4c9 {symbol} RSI {rsi_val:.0f} (oversold, <= {RSI_OVERSOLD})"
+                    )
+                    db_execute(
+                        "UPDATE watchlist SET rsi_low_alerted = 1 WHERE symbol = ?",
+                        (symbol,)
+                    )
+                else:
+                    # Reset whichever flags no longer apply, so the alert can fire again later.
+                    if rsi_hi_flag and rsi_val < RSI_OVERBOUGHT:
+                        db_execute(
+                            "UPDATE watchlist SET rsi_high_alerted = 0 WHERE symbol = ?",
+                            (symbol,)
+                        )
+                    if rsi_lo_flag and rsi_val > RSI_OVERSOLD:
+                        db_execute(
+                            "UPDATE watchlist SET rsi_low_alerted = 0 WHERE symbol = ?",
+                            (symbol,)
+                        )
 
         except Exception as e:
             print(f"[watchlist_checker] Error processing {symbol}: {e}")

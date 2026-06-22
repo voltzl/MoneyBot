@@ -361,6 +361,7 @@ async def help(ctx):
     msg = (
         "**\U0001f4c8 Stock Bot Commands**\n\n"
         "`!add SYMBOL [percent]` - add a stock; optional drop-alert percent (default 15)\n"
+        "`!addmany SYMBOL1 SYMBOL2 ...` - add several stocks at once (default threshold)\n"
         "`!remove SYMBOL` - remove a stock\n"
         "`!threshold SYMBOL percent` - change a stock's drop-alert percent\n"
         "`!watchlist` - list tracked stocks, baselines, and thresholds\n"
@@ -394,6 +395,51 @@ async def add(ctx, symbol: str, threshold: float = None):
     )
 
     await ctx.send(f"\u2705 Added {symbol} at ${price:.2f} (alert at -{thr*100:.0f}% from peak)")
+
+@bot.command()
+async def addmany(ctx, *symbols: str):
+    """Add multiple symbols at once with the default threshold, e.g. !addmany AAPL MSFT NVDA"""
+    if not symbols:
+        return await ctx.send("Usage: !addmany SYMBOL1 SYMBOL2 ...")
+
+    # De-duplicate within the request while preserving order.
+    seen = set()
+    requested = []
+    for s in symbols:
+        s = s.upper()
+        if s not in seen:
+            seen.add(s)
+            requested.append(s)
+
+    added, already, failed = [], [], []
+
+    for symbol in requested:
+        if db_execute("SELECT 1 FROM watchlist WHERE symbol = ?", (symbol,), fetch=True):
+            already.append(symbol)
+            continue
+
+        price = await fetch_current_price(symbol)
+        if price is None:
+            failed.append(symbol)
+            await asyncio.sleep(0.5)
+            continue
+
+        db_execute(
+            "INSERT INTO watchlist (symbol, baseline, threshold, peak) VALUES (?, ?, ?, ?)",
+            (symbol, price, DEFAULT_DROP_THRESHOLD, price)
+        )
+        added.append(symbol)
+        await asyncio.sleep(0.5)  # be gentle with the data source
+
+    lines = []
+    if added:
+        lines.append(f"\u2705 Added: {', '.join(added)}")
+    if already:
+        lines.append(f"\u26a0\ufe0f Already present: {', '.join(already)}")
+    if failed:
+        lines.append(f"\u274c Couldn't fetch: {', '.join(failed)}")
+
+    await ctx.send("\n".join(lines) or "Nothing to add")
 
 @bot.command()
 async def threshold(ctx, symbol: str, percent: float):

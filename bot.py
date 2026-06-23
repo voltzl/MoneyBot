@@ -48,9 +48,13 @@ load_dotenv()
 TOKEN = os.getenv("TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-# Optional: a role or user ID to ping on alerts. Leave unset to disable.
+# Who to ping on alerts. ALERT_MENTION_TYPE can be:
+#   "everyone" - pings @everyone (no ID needed; bot needs Mention Everyone permission)
+#   "role"     - pings the role whose ID is in ALERT_MENTION_ID
+#   "user"     - pings the user whose ID is in ALERT_MENTION_ID
+# Leave ALERT_MENTION_TYPE unset/blank (or omit the ID for role/user) to disable.
 ALERT_MENTION_ID = os.getenv("ALERT_MENTION_ID")
-ALERT_MENTION_TYPE = os.getenv("ALERT_MENTION_TYPE", "role")  # "role" or "user"
+ALERT_MENTION_TYPE = os.getenv("ALERT_MENTION_TYPE", "role")  # "everyone", "role", or "user"
 
 DB_FILE = "watchlist.db"
 DEFAULT_DROP_THRESHOLD = 0.15  # 15%
@@ -85,17 +89,30 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # symbol -> (timestamp, dataframe)
 _history_cache = {}
 
+# Tracks the last known market open/closed state so we announce only on change.
+# None until the first loop run establishes a baseline.
+_market_open_state = None
+
 # -------------------------------------------------
 # Mention Helper
 # -------------------------------------------------
 
 def alert_prefix():
     """Return a mention string to prepend to alerts, or empty string if disabled."""
+    if ALERT_MENTION_TYPE == "everyone":
+        return "@everyone "
     if not ALERT_MENTION_ID:
         return ""
     if ALERT_MENTION_TYPE == "user":
         return f"<@{ALERT_MENTION_ID}> "
     return f"<@&{ALERT_MENTION_ID}> "
+
+# Discord suppresses @everyone/role/user pings by default; this opts them back in.
+ALERT_ALLOWED = discord.AllowedMentions(everyone=True, roles=True, users=True)
+
+async def send_alert(channel, content, **kwargs):
+    """Send an alert message with mentions enabled so pings actually notify."""
+    return await channel.send(content, allowed_mentions=ALERT_ALLOWED, **kwargs)
 
 # -------------------------------------------------
 # Market Hours
@@ -348,7 +365,10 @@ def detect_cross(df):
 @bot.event
 async def on_ready():
     init_db()
-    watchlist_checker.start()
+    if not watchlist_checker.is_running():
+        watchlist_checker.start()
+    if not market_status_checker.is_running():
+        market_status_checker.start()
     print(f"Logged in as {bot.user}")
 
 # -------------------------------------------------
@@ -584,11 +604,11 @@ async def fib(ctx, symbol: str):
 
 @tasks.loop(minutes=15)
 async def watchlist_checker():
-    if RESPECT_MARKET_HOURS and not market_is_open():
-        return
-
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
     ping = alert_prefix()
+
+    if RESPECT_MARKET_HOURS and not market_is_open():
+        return
 
     stocks = db_execute(
         "SELECT symbol, baseline, threshold, peak, alerted, golden_alerted, "
@@ -610,7 +630,8 @@ async def watchlist_checker():
                     (new_fail, symbol)
                 )
                 if new_fail == FAIL_LIMIT:
-                    await channel.send(
+                    await send_alert(
+                        channel,
                         f"{ping}\u2753 {symbol} has failed {FAIL_LIMIT} fetches in a row. "
                         f"It may be delisted or mistyped. Consider !remove {symbol}."
                     )
@@ -637,7 +658,8 @@ async def watchlist_checker():
 
             if drop >= thr:
                 if not alerted:
-                    await channel.send(
+                    await send_alert(
+                        channel,
                         f"{ping}\U0001f6a8 {symbol} dropped {drop*100:.1f}% from its recent peak "
                         f"(${current_peak:.2f} -> ${price_now:.2f})"
                     )
@@ -661,13 +683,13 @@ async def watchlist_checker():
             signal = detect_cross(df)
 
             if signal == "golden" and not g_flag:
-                await channel.send(f"{ping}\U0001f680 GOLDEN CROSS: {symbol}")
+                await send_alert(channel, f"{ping}\U0001f680 GOLDEN CROSS: {symbol}")
                 db_execute(
                     "UPDATE watchlist SET golden_alerted = 1, death_alerted = 0 WHERE symbol = ?",
                     (symbol,)
                 )
             elif signal == "death" and not d_flag:
-                await channel.send(f"{ping}\U0001f480 DEATH CROSS: {symbol}")
+                await send_alert(channel, f"{ping}\U0001f480 DEATH CROSS: {symbol}")
                 db_execute(
                     "UPDATE watchlist SET death_alerted = 1, golden_alerted = 0 WHERE symbol = ?",
                     (symbol,)
@@ -677,7 +699,8 @@ async def watchlist_checker():
             rsi_val = compute_rsi_series(df["Close"]).iloc[-1]
             if pd.notna(rsi_val):
                 if rsi_val >= RSI_OVERBOUGHT and not rsi_hi_flag:
-                    await channel.send(
+                    await send_alert(
+                        channel,
                         f"{ping}\U0001f4c8 {symbol} RSI {rsi_val:.0f} (overbought, >= {RSI_OVERBOUGHT})"
                     )
                     db_execute(
@@ -685,7 +708,8 @@ async def watchlist_checker():
                         (symbol,)
                     )
                 elif rsi_val <= RSI_OVERSOLD and not rsi_lo_flag:
-                    await channel.send(
+                    await send_alert(
+                        channel,
                         f"{ping}\U0001f4c9 {symbol} RSI {rsi_val:.0f} (oversold, <= {RSI_OVERSOLD})"
                     )
                     db_execute(
@@ -712,6 +736,39 @@ async def watchlist_checker():
 
 @watchlist_checker.before_loop
 async def before_loop():
+    await bot.wait_until_ready()
+
+# -------------------------------------------------
+# Market Open/Close Announcer (fast loop, no API calls)
+# -------------------------------------------------
+
+@tasks.loop(minutes=1)
+async def market_status_checker():
+    """Announce market open/close transitions. This is just a time check,
+    so running every minute adds no data-source load."""
+    global _market_open_state
+
+    is_open = market_is_open()
+
+    # First run establishes the baseline silently so a restart doesn't announce.
+    if _market_open_state is None:
+        _market_open_state = is_open
+        return
+
+    if is_open == _market_open_state:
+        return
+
+    _market_open_state = is_open
+    channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
+    ping = alert_prefix()
+
+    if is_open:
+        await send_alert(channel, f"{ping}\U0001f7e2 Market is now OPEN")
+    else:
+        await send_alert(channel, f"{ping}\U0001f534 Market is now CLOSED")
+
+@market_status_checker.before_loop
+async def before_market_loop():
     await bot.wait_until_ready()
 
 # -------------------------------------------------

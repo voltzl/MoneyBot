@@ -199,7 +199,8 @@ def init_db():
                 last_score_time REAL,
                 last_score_alert_time REAL,
                 pre_break_alerted INTEGER DEFAULT 0,
-                breakout_alerted INTEGER DEFAULT 0
+                breakout_alerted INTEGER DEFAULT 0,
+                added_by TEXT
             )
         """)
         conn.execute("""
@@ -230,6 +231,7 @@ def init_db():
             "last_score_alert_time": "ALTER TABLE watchlist ADD COLUMN last_score_alert_time REAL",
             "pre_break_alerted": "ALTER TABLE watchlist ADD COLUMN pre_break_alerted INTEGER DEFAULT 0",
             "breakout_alerted": "ALTER TABLE watchlist ADD COLUMN breakout_alerted INTEGER DEFAULT 0",
+            "added_by": "ALTER TABLE watchlist ADD COLUMN added_by TEXT",
         }
         for col, stmt in migrations.items():
             if col not in cols:
@@ -837,8 +839,8 @@ async def add(ctx, symbol: str, threshold: float = None):
     thr = DEFAULT_DROP_THRESHOLD if threshold is None else threshold / 100.0
 
     db_execute(
-        "INSERT INTO watchlist (symbol, baseline, threshold, peak) VALUES (?, ?, ?, ?)",
-        (symbol, price, thr, price)
+        "INSERT INTO watchlist (symbol, baseline, threshold, peak, added_by) VALUES (?, ?, ?, ?, ?)",
+        (symbol, price, thr, price, str(user_id))
     )
     add_subscription(symbol, user_id)
 
@@ -880,8 +882,8 @@ async def addmany(ctx, *symbols: str):
             continue
 
         db_execute(
-            "INSERT INTO watchlist (symbol, baseline, threshold, peak) VALUES (?, ?, ?, ?)",
-            (symbol, price, DEFAULT_DROP_THRESHOLD, price)
+            "INSERT INTO watchlist (symbol, baseline, threshold, peak, added_by) VALUES (?, ?, ?, ?, ?)",
+            (symbol, price, DEFAULT_DROP_THRESHOLD, price, str(user_id))
         )
         add_subscription(symbol, user_id)
         added.append(symbol)
@@ -943,7 +945,7 @@ async def watchlist(ctx, scope: str = None):
 
     if show_all:
         rows = db_execute(
-            "SELECT symbol, baseline, threshold, peak, last_signal, last_score FROM watchlist",
+            "SELECT symbol, baseline, threshold, peak, last_signal, last_score, added_by FROM watchlist",
             fetch=True
         )
     else:
@@ -952,7 +954,7 @@ async def watchlist(ctx, scope: str = None):
             return await ctx.send("You're not watching anything yet. Try !add SYMBOL")
         placeholders = ",".join("?" for _ in my_symbols)
         rows = db_execute(
-            f"SELECT symbol, baseline, threshold, peak, last_signal, last_score "
+            f"SELECT symbol, baseline, threshold, peak, last_signal, last_score, added_by "
             f"FROM watchlist WHERE symbol IN ({placeholders})",
             tuple(my_symbols),
             fetch=True
@@ -962,14 +964,15 @@ async def watchlist(ctx, scope: str = None):
         return await ctx.send("Empty watchlist")
 
     lines = []
-    for s, b, t, peak, sig, score in rows:
+    for s, b, t, peak, sig, score, added_by in rows:
         peak_str = f", peak ${peak:.2f}" if peak else ""
         score_str = f" | {sig} {score}/10" if sig else ""
-        watchers = "" if show_all else ""
+        watchers = ""
         if show_all:
             n = len(get_subscribers(s))
             watchers = f" ({n} watching)"
-        lines.append(f"{s} - ${b:.2f} (alert -{t*100:.0f}%{peak_str}){score_str}{watchers}")
+        added_str = f" | added by <@{added_by}>" if added_by else ""
+        lines.append(f"{s} - ${b:.2f} (alert -{t*100:.0f}%{peak_str}){score_str}{watchers}{added_str}")
     await ctx.send("\n".join(lines))
 
 @bot.command()

@@ -1153,7 +1153,7 @@ async def watchlist_checker():
     stocks = db_execute(
         "SELECT symbol, baseline, threshold, peak, alerted, golden_alerted, "
         "death_alerted, rsi_high_alerted, rsi_low_alerted, fail_count, "
-        "last_signal, last_score_alert_time, pre_break_alerted, breakout_alerted "
+        "last_signal, last_score, last_score_alert_time, pre_break_alerted, breakout_alerted "
         "FROM watchlist",
         fetch=True
     )
@@ -1161,7 +1161,7 @@ async def watchlist_checker():
     top_setups = []
 
     for (symbol, baseline, thr, peak, alerted, g_flag, d_flag,
-         rsi_hi_flag, rsi_lo_flag, fail_count, prev_signal,
+         rsi_hi_flag, rsi_lo_flag, fail_count, prev_signal, prev_score_recorded,
          last_score_alert_time, pre_break_flag, breakout_flag) in stocks:
         try:
             # PRICE
@@ -1272,6 +1272,12 @@ async def watchlist_checker():
                     db_execute("UPDATE watchlist SET breakout_alerted = 0 WHERE symbol = ?", (symbol,))
 
             # SETUP SCORE / TRADE PLAN CHECK
+            # Capture the score on record BEFORE calling get_signal, since
+            # get_signal() itself overwrites last_score/last_score_time as
+            # part of its momentum/freshness calc. Comparing against this
+            # captured value (not a post-hoc re-SELECT) is what makes
+            # became_strong/score_jump actually detect real changes run
+            # over run, instead of only firing once on a symbol's first scan.
             signal_result = await get_signal(symbol, df=df.tail(126))  # ~6mo for EMA stability
             if signal_result:
                 signal, final_score, price, sig_df = signal_result
@@ -1280,15 +1286,19 @@ async def watchlist_checker():
                     top_setups.append((symbol, signal, final_score, price, sig_df))
 
                 signal_changed = signal != prev_signal
-                became_strong = (
-                    prev_signal is None or
-                    db_execute(
-                        "SELECT last_score FROM watchlist WHERE symbol = ?", (symbol,), fetch=True
-                    )[0][0] is None
-                )
 
-                should_alert = (signal_changed and final_score >= SCORE_ALERT_THRESHOLD) or (
-                    final_score >= SCORE_ALERT_THRESHOLD and became_strong
+                if prev_score_recorded is None:
+                    # never scored before, treat any qualifying score as new
+                    became_strong = final_score >= SCORE_ALERT_THRESHOLD
+                    score_jump = 0.0
+                else:
+                    became_strong = prev_score_recorded < SCORE_ALERT_THRESHOLD and final_score >= SCORE_ALERT_THRESHOLD
+                    score_jump = final_score - prev_score_recorded
+
+                should_alert = (
+                    (signal_changed and final_score >= SCORE_ALERT_THRESHOLD) or
+                    became_strong or
+                    (score_jump >= 1.0 and final_score >= SCORE_ALERT_THRESHOLD)
                 )
 
                 cooldown_ok = (

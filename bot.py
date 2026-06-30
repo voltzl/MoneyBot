@@ -117,10 +117,6 @@ _history_cache = {}
 # None until the first loop run establishes a baseline.
 _market_open_state = None
 
-# In-memory only: whether we've posted the "top setups" startup message yet.
-# Not worth persisting across restarts, a duplicate post on restart is harmless.
-_first_run_top_setups = True
-
 # -------------------------------------------------
 # Mention Helper
 # -------------------------------------------------
@@ -1147,8 +1143,6 @@ async def top(ctx):
 
 @tasks.loop(minutes=5)
 async def watchlist_checker():
-    global _first_run_top_setups
-
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
 
     # --- daily heat map, once per day after close. Checked BEFORE the
@@ -1356,12 +1350,23 @@ async def watchlist_checker():
 
         await asyncio.sleep(0.5)
 
-    # --- startup "top setups" digest, once per process lifetime ---
-    if _first_run_top_setups and top_setups:
+    # --- daily "Top Setups" digest, once per day at/after 8:35 AM Central ---
+    # Uses a 10-minute catch window (8:35-8:45 CT) since watchlist_checker
+    # ticks every 5 minutes from whenever the bot happened to start, not
+    # aligned to the clock, so a single exact-minute check could be missed.
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    today_ct_str = now_ct.date().isoformat()
+    last_top_setups_date = get_meta("last_top_setups_date")
+
+    in_daily_window = (
+        now_ct.hour == 8 and 35 <= now_ct.minute < 45
+    )
+
+    if last_top_setups_date != today_ct_str and in_daily_window and top_setups:
         top_setups.sort(key=lambda x: x[2], reverse=True)
         top3 = top_setups[:3]
 
-        message = "\U0001f525 Top Setups at Startup:\n"
+        message = "\U0001f525 Top Setups of the morning:\n"
         for i, (symbol, signal, final_score, price, sig_df) in enumerate(top3, 1):
             atr = get_atr(sig_df)
             plan = build_trade_plan(signal, price, atr, final_score)
@@ -1374,7 +1379,7 @@ async def watchlist_checker():
                 )
 
         await channel.send(message)
-        _first_run_top_setups = False
+        set_meta("last_top_setups_date", today_ct_str)
 
 @watchlist_checker.before_loop
 async def before_loop():

@@ -470,12 +470,24 @@ def get_score(ema50, ema200, rsi, market_bias, signal):
 
     return round(score, 1)
 
-async def get_signal(symbol, df=None):
+async def get_signal(symbol, df=None, persist=True):
     """
-    Returns (signal, final_score, price, df) or None.
-    Score momentum / freshness penalty are read from and written to SQLite
-    (last_score, last_score_time) instead of in-memory globals, so they
-    survive restarts.
+    Returns (signal, final_score, price, df, raw_score) or None.
+
+    final_score is the momentum/freshness-adjusted number shown in alerts
+    and trade plans. raw_score is the unadjusted 0-10 score from get_score()
+    for this scan alone, returned so callers can compare raw-to-raw across
+    scans (e.g. "did the underlying setup itself cross the threshold")
+    rather than comparing a prior raw score against a momentum-boosted
+    current final_score, which conflates two different things.
+
+    persist controls whether this call writes its score back to SQLite as
+    the new "last_score" baseline. The automated watchlist_checker loop
+    should always persist (persist=True, the default) since it's the one
+    walking time forward and building momentum/freshness off itself.
+    Manual on-demand lookups (!score, !top) pass persist=False so a quick
+    check doesn't reset the freshness clock or momentum baseline that the
+    background loop is relying on.
     """
     if df is None:
         df = await fetch_history(symbol, period="6mo")
@@ -516,12 +528,13 @@ async def get_signal(symbol, df=None):
     freshness_penalty = min(age / 3600, 2)  # caps at 2 points over time
     final_score = round(final_score - freshness_penalty, 1)
 
-    db_execute(
-        "UPDATE watchlist SET last_score = ?, last_score_time = ? WHERE symbol = ?",
-        (score, time.time(), symbol)
-    )
+    if persist:
+        db_execute(
+            "UPDATE watchlist SET last_score = ?, last_score_time = ? WHERE symbol = ?",
+            (score, time.time(), symbol)
+        )
 
-    return signal, final_score, price, df
+    return signal, final_score, price, df, score
 
 def build_trade_plan(signal, price, atr, score):
     if atr is None or atr <= 0:
@@ -1079,12 +1092,12 @@ async def bias(ctx):
 async def score(ctx, symbol: str):
     """Setup score (0-10) and trade plan for a symbol."""
     symbol = symbol.upper()
-    result = await get_signal(symbol)
+    result = await get_signal(symbol, persist=False)
 
     if result is None:
         return await ctx.send(f"\u274c Could not score {symbol}, check the symbol or try again")
 
-    signal, final_score, price, df = result
+    signal, final_score, price, df, raw_score = result
     atr = get_atr(df)
     plan = build_trade_plan(signal, price, atr, final_score)
 
@@ -1104,10 +1117,10 @@ async def top(ctx):
 
     setups = []
     for symbol in symbols:
-        result = await get_signal(symbol)
+        result = await get_signal(symbol, persist=False)
         if result is None:
             continue
-        signal, final_score, price, df = result
+        signal, final_score, price, df, raw_score = result
         setups.append((symbol, signal, final_score, price, df))
         await asyncio.sleep(0.3)
 
@@ -1138,17 +1151,20 @@ async def watchlist_checker():
 
     channel = bot.get_channel(CHANNEL_ID) or await bot.fetch_channel(CHANNEL_ID)
 
-    if RESPECT_MARKET_HOURS and not market_is_open():
-        return
-
-    # --- daily heat map, once per day after close ---
+    # --- daily heat map, once per day after close. Checked BEFORE the
+    # market-hours gate below, since this is specifically meant to fire
+    # once the market has closed, not while it's still open. ---
     now_et = datetime.now(ZoneInfo("America/New_York"))
     today_str = now_et.date().isoformat()
     last_heatmap_date = get_meta("last_heatmap_date")
 
-    if last_heatmap_date != today_str and now_et.hour >= HEATMAP_HOUR_ET:
+    if (last_heatmap_date != today_str and now_et.hour >= HEATMAP_HOUR_ET
+            and now_et.weekday() < 5):  # Mon-Fri only
         await send_heatmap(channel)
         set_meta("last_heatmap_date", today_str)
+
+    if RESPECT_MARKET_HOURS and not market_is_open():
+        return
 
     stocks = db_execute(
         "SELECT symbol, baseline, threshold, peak, alerted, golden_alerted, "
@@ -1278,9 +1294,20 @@ async def watchlist_checker():
             # captured value (not a post-hoc re-SELECT) is what makes
             # became_strong/score_jump actually detect real changes run
             # over run, instead of only firing once on a symbol's first scan.
+            #
+            # became_strong/score_jump compare prev_score_recorded (last
+            # cycle's RAW score) against raw_score (this cycle's RAW score),
+            # not final_score, since final_score already has a momentum
+            # bonus and freshness penalty baked in. Comparing raw-to-final
+            # would conflate "the setup genuinely got stronger" with "the
+            # momentum math gave it a boost," and could fire on momentum
+            # alone without the underlying score having moved much.
+            # final_score is still what's shown in the alert and what gates
+            # whether a score even counts as a "top setup" in the first
+            # place, since that's the number actually being acted on.
             signal_result = await get_signal(symbol, df=df.tail(126))  # ~6mo for EMA stability
             if signal_result:
-                signal, final_score, price, sig_df = signal_result
+                signal, final_score, price, sig_df, raw_score = signal_result
 
                 if final_score >= SCORE_ALERT_THRESHOLD:
                     top_setups.append((symbol, signal, final_score, price, sig_df))
@@ -1292,8 +1319,8 @@ async def watchlist_checker():
                     became_strong = final_score >= SCORE_ALERT_THRESHOLD
                     score_jump = 0.0
                 else:
-                    became_strong = prev_score_recorded < SCORE_ALERT_THRESHOLD and final_score >= SCORE_ALERT_THRESHOLD
-                    score_jump = final_score - prev_score_recorded
+                    became_strong = prev_score_recorded < SCORE_ALERT_THRESHOLD and raw_score >= SCORE_ALERT_THRESHOLD
+                    score_jump = raw_score - prev_score_recorded
 
                 should_alert = (
                     (signal_changed and final_score >= SCORE_ALERT_THRESHOLD) or
